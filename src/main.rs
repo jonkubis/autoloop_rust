@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::convert::TryInto;
@@ -5,6 +6,8 @@ use rayon::prelude::*;
 use std::sync::{Mutex, Arc};
 use std::env;
 use std::process;
+use std::simd::f32x4;
+use std::slice;
 
 
 #[derive(Debug)]
@@ -42,7 +45,6 @@ impl FmtChunk {
 struct Loop {
 	start: usize,
 	end: usize,
-	length: usize,
 	error: f32,
 }
 
@@ -59,7 +61,7 @@ fn compute_thread(samples: Vec<Vec<f32>>, start: usize, step: usize, min_length:
 		for end in (this_start + min_length)..max_len {
 			let error = estimate(&samples, this_start, end, tail_length);
 			
-			let this_loop = Loop { start: this_start, end: end, length: (end - start), error: error };
+			let this_loop = Loop { start: this_start, end: end, error: error };
 			if error < best_error {
 				local_best_loops.insert(0, this_loop);
 				best_error = error;
@@ -73,10 +75,7 @@ fn compute_thread(samples: Vec<Vec<f32>>, start: usize, step: usize, min_length:
 		// Lock and update the global best loops
 		let mut best_loops_guard = best_loops.lock().unwrap();
 		for l in local_best_loops {
-			// Here you can insert loops into the global list, possibly keeping it sorted or applying other criteria
-			// For example:
 			best_loops_guard.push(l);
-			// You might want to sort or truncate the list here if needed
 		}
 	});
 	
@@ -124,18 +123,41 @@ fn parse_audio_data(data: Vec<u8>, num_channels: usize, bits_per_sample: usize) 
 }
 
 
-
 fn estimate(samples: &Vec<Vec<f32>>, start: usize, end: usize, tail_length: usize) -> f32 {
 	let channels = samples.len();
-	
 	let mut error: f32 = 0.0;
+	
 	for ch in 0..channels {
-		for i in 0..tail_length {
-			let a = samples[ch][start + i];
-			let b = samples[ch][end + i];
+		let sample_slice_start = unsafe { slice::from_raw_parts(samples[ch].as_ptr().add(start), tail_length) };
+		let sample_slice_end = unsafe { slice::from_raw_parts(samples[ch].as_ptr().add(end), tail_length) };
+		
+		let mut i = 0;
+		while i + 3 < tail_length {
+			let a = unsafe { f32x4::from_array([
+				*sample_slice_start.get_unchecked(i),
+				*sample_slice_start.get_unchecked(i + 1),
+				*sample_slice_start.get_unchecked(i + 2),
+				*sample_slice_start.get_unchecked(i + 3),
+			]) };
+			let b = unsafe { f32x4::from_array([
+				*sample_slice_end.get_unchecked(i),
+				*sample_slice_end.get_unchecked(i + 1),
+				*sample_slice_end.get_unchecked(i + 2),
+				*sample_slice_end.get_unchecked(i + 3),
+			]) };
+			let diff = a - b;
+			let squared = diff * diff;
+			error += squared.to_array().iter().sum::<f32>();
+			i += 4;
+		}
+		
+		for j in i..tail_length {
+			let a = unsafe { *sample_slice_start.get_unchecked(j) };
+			let b = unsafe { *sample_slice_end.get_unchecked(j) };
 			error += (a - b).powi(2);
 		}
 	}
+	
 	if !error.is_finite() {
 		println!("Error is not finite");
 	}
@@ -149,8 +171,8 @@ fn normalize_audio(samples: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
 	
 	let mut normalized = vec![vec![0.0; samples[0].len()]; samples.len()];
 	
-	for (ch, sample_ch) in samples.iter().enumerate() {
-		for &sample in sample_ch {
+	for ch in samples.iter() {
+		for &sample in ch {
 			if sample > max {
 				max = sample;
 			}
@@ -188,8 +210,6 @@ fn main() -> io::Result<()> {
 	
 	let file_size = f.seek(SeekFrom::End(0))?;
 	
-	//println!("File size={}",file_size);
-	
 	f.seek(SeekFrom::Start(0))?;
 	
 	let mut tag = [0; 4];
@@ -205,7 +225,7 @@ fn main() -> io::Result<()> {
 	
 	f.read_exact(&mut buffer)?;
 	// get file size (aka 'chunk size')
-	//let file_size_from_header = u32::from_le_bytes(buffer) + 8;
+	// let file_size_from_header = u32::from_le_bytes(buffer) + 8;
 	
 	// 'WAVE'
 	f.read_exact(&mut tag)?;
